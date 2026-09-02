@@ -403,6 +403,20 @@ impl RegionStatsManager {
                 );
                 assert!(tikv_util::thread_group::is_shutdown(!cfg!(test)));
             }
+            // Drop our own sender so that `rx.recv()` returns `None` once every
+            // callback has been either invoked or dropped.
+            //
+            // `RegionCacheEngineManager::evict_region` only keeps the callback
+            // when it reaches `mark_evict`, which requires the region to still
+            // be `Active`. If a concurrent eviction has already moved it to
+            // `PendingEvict`, or the region is gone entirely, the callback is
+            // dropped and can never fire. Without dropping `tx` the loop below
+            // would wait for it forever, because the channel is never closed.
+            //
+            // A callback that *was* kept holds its own sender clone inside the
+            // region's meta, so regions still blocked on an ongoing snapshot
+            // are unaffected.
+            drop(tx);
             for _ in 0..regions.len() {
                 // It's better to use `timeout(Duration, rx.recv())` but which needs to use
                 // tokio runtime with timer enabled while yatp does not.
@@ -755,6 +769,132 @@ pub mod tests {
         }
 
         let _ = handle.join();
+    }
+
+    // Regression test for a lost eviction-finished callback.
+    //
+    // `RegionCacheEngineManager::evict_region` only stores the callback when it
+    // reaches `mark_evict` for a region that is still `Active`. If a concurrent
+    // eviction (raftstore `BecomeFollower` / `IngestSST` / ..., or the write
+    // path hitting `capacity`) has already moved the region to `PendingEvict`,
+    // `do_evict_region` returns at the `prev_state.is_evict()` arm and the
+    // callback is dropped instead.
+    //
+    // `evict_on_evict_threshold_reached` nevertheless waits for one message per
+    // region it handed a callback to, and `tx` is still in scope while it waits,
+    // so `rx.recv()` can never observe a closed channel. The task then parks
+    // forever and its caller never clears `memory_checking`.
+    #[test]
+    fn test_evict_on_evict_threshold_reached_with_dropped_callback() {
+        let skiplist_engine = SkiplistEngine::new();
+        let mut config = InMemoryEngineConfig::config_for_test();
+        config.stop_load_threshold = Some(ReadableSize::kb(1));
+        config.mvcc_amplification_threshold = 10;
+        let config = Arc::new(VersionTrack::new(config));
+        let mc = MemoryController::new(config.clone(), skiplist_engine);
+        let (scheduler, _rx) = dummy_scheduler();
+
+        // Same fixture as `test_collect_candidates_for_eviction`, whose first
+        // chunk of eviction candidates is [6, 4].
+        let regions = [
+            new_region(1, b"k01", b"k02"),
+            new_region(2, b"k03", b"k04"),
+            new_region(3, b"k05", b"k06"),
+            new_region(4, b"k07", b"k08"),
+            new_region(5, b"k09", b"k10"),
+            new_region(6, b"k11", b"k12"),
+        ];
+        let region_stats = [
+            new_region_stat(1, 100, 6),
+            new_region_stat(1, 10000, 1000),
+            new_region_stat(1, 100000, 100000),
+            new_region_stat(1, 100, 50),
+            new_region_stat(1, 1000, 120),
+            new_region_stat(1, 20, 2),
+        ];
+        let all_regions: TopRegions = regions
+            .iter()
+            .cloned()
+            .zip(region_stats.iter().cloned())
+            .collect();
+        let sim = Arc::new(RegionInfoSimulator {
+            regions: Mutex::new(all_regions.clone()),
+            region_stats: Mutex::new(
+                all_regions
+                    .iter()
+                    .map(|(r, s)| (r.id, (r.clone(), s.clone())))
+                    .collect::<HashMap<u64, (Region, RegionStat)>>(),
+            ),
+        });
+        // 10 ms min duration eviction for testing purposes.
+        let rsm = RegionStatsManager::new(config.clone(), Duration::from_millis(10), sim);
+        rsm.collect_regions_to_load_and_evict(0, new_cached_regions(vec![]), &mc);
+        std::thread::sleep(Duration::from_millis(100));
+
+        let registered = Arc::new(Mutex::new(vec![]));
+        let registered2 = registered.clone();
+        let evict_fn = move |evict_region: &CacheRegion,
+                             _: EvictReason,
+                             cb: Option<OnEvictFinishedCallback>|
+              -> Vec<CacheRegion> {
+            if evict_region.id == 4 {
+                // Region 4 moved to `PendingEvict` between `cached_regions()`
+                // and this call, so `do_evict_region` bails before
+                // `mark_evict` and the callback is destroyed.
+                drop(cb);
+            } else {
+                registered2.lock().push(cb.unwrap());
+            }
+            vec![]
+        };
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished2 = finished.clone();
+        std::thread::spawn(move || {
+            block_on(async {
+                rsm.evict_on_evict_threshold_reached(
+                    evict_fn,
+                    &scheduler,
+                    new_cached_regions(vec![1, 2, 3, 4, 5, 6]),
+                    &mc,
+                )
+                .await
+            });
+            finished2.store(true, Ordering::SeqCst);
+        });
+
+        // Invoke the one callback that was actually registered, as
+        // `on_delete_regions` does once the region's memory has been freed.
+        let t = Instant::now();
+        loop {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "eviction task never reached the candidates"
+            );
+            if registered.lock().len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cb = registered.lock().pop().unwrap();
+        block_on(cb());
+
+        // Both candidates are now accounted for: region 6 was evicted and its
+        // callback fired, region 4 is being evicted by someone else and will
+        // never call back. Nothing is left to wait for, so the task must finish
+        // and let its caller clear `memory_checking`.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            if finished.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "evict_on_evict_threshold_reached is still waiting for a callback that was \
+             dropped instead of registered: `tx` is in scope for the whole chunk, so \
+             rx.recv() never returns None"
+        );
     }
 
     #[test]
